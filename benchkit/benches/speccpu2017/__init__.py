@@ -87,7 +87,7 @@ from benchkit.core.bktypes.callresults import BuildResult, FetchResult, RunResul
 from benchkit.core.bktypes.contexts import BuildContext, CollectContext, FetchContext, RunContext
 from benchkit.dependencies.packages import PackageDependency
 from benchkit.utils.dir import benchkit_home_dir, get_benches_dir
-from benchkit.utils.fetchtools import fuseiso_mount, fuseiso_umount, sed_edit
+from benchkit.utils.fetchtools import iso_extract, sed_edit
 
 
 class SPECCPU2017Bench:
@@ -115,9 +115,9 @@ class SPECCPU2017Bench:
 
         This fetch step does **not** clone anything from GitHub. Instead it:
         - creates `<parent_dir>/spec` if needed
-        - mounts `spec_source_iso` via FUSE (no sudo)
+        - extracts `spec_source_iso` without mounting it
         - runs SPEC's `install.sh` non-interactively into `<parent_dir>/spec`
-        - unmounts the ISO
+        - removes the extracted ISO contents
         - copies `config/Example-gcc-linux-x86.cfg` to `config/config-gcc-linux-x86.cfg`
         - patches the config to use `/usr` instead of the devtoolset path
 
@@ -135,7 +135,7 @@ class SPECCPU2017Bench:
         """
         parent_dir = get_benches_dir(parent_dir=parent_dir, comm=ctx.platform.comm)
         spec_dir = parent_dir / "spec-cpu-2017"
-        mnt_dir = benchkit_home_dir() / "spec-cpu-2017-mnt"
+        iso_dir = benchkit_home_dir(comm=ctx.platform.comm) / "spec-cpu-2017-iso"
 
         comm = ctx.platform.comm
 
@@ -144,15 +144,15 @@ class SPECCPU2017Bench:
 
         comm.makedirs(path=spec_dir, exist_ok=True)
 
-        fuseiso_mount(ctx, spec_source_iso, mnt_dir)
+        iso_extract(ctx, spec_source_iso, iso_dir)
 
         ctx.exec(
             argv=["bash", "-lc", f"yes | ./install.sh -d {spec_dir}"],
-            cwd=mnt_dir,
+            cwd=iso_dir,
             output_is_log=True,
         )
 
-        fuseiso_umount(ctx, mnt_dir)
+        comm.remove(path=iso_dir, recursive=True)
 
         # cp config
         # TODO: support ARM
@@ -339,7 +339,9 @@ class SPECCPU2017Bench:
 
         Dependencies include:
             - build-essential: C/C++ compiler and build tools
+            - libarchive-tools: bsdtar utility for extracting the SPEC ISO
         """
         return [
             PackageDependency("build-essential"),
+            PackageDependency("libarchive-tools"),
         ]

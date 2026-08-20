@@ -10,6 +10,7 @@ This module provides reusable helper functions for typical benchmark fetch opera
 - curl : Download files or fetch remote resources over HTTP(S), FTP, and related protocols
 - sed : Apply in-place text substitutions/patches to files
 - tar : Extract tar archives (e.g., .tar, .tar.gz, .tgz) on the target machine
+- iso_extract: Extract ISO disk images on the target machine
 - fuseiso_mount: Mount ISO disk images to the target machine without root
 - fuseiso_umount: Unmount ISO disk images from the target machine without root
 
@@ -294,6 +295,41 @@ def tar_extract(
     )
 
     return extract_dir
+
+
+def iso_extract(
+    ctx: BaseContext,
+    image: Path,
+    destination: Path,
+) -> Path:
+    """
+    Extract an ISO image on the target machine using bsdtar.
+
+    Args:
+        ctx: Context providing platform and execution capabilities.
+        image: Path to the ISO image on the target machine.
+        destination: Directory where the ISO contents should be extracted.
+
+    Returns:
+        Path to the extraction directory.
+
+    Raises:
+        FileNotFoundError: If the ISO image does not exist on the target machine.
+    """
+    comm = ctx.platform.comm
+
+    if not comm.isfile(image):
+        raise FileNotFoundError(f"ISO image not found on target machine: {image}")
+
+    if not comm.isdir(destination):
+        comm.makedirs(path=destination, exist_ok=True)
+
+    ctx.exec(
+        argv=["bsdtar", "-xf", str(image), "-C", str(destination)],
+        cwd=destination,
+    )
+
+    return destination
 
 
 def fuseiso_mount(
