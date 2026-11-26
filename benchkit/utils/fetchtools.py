@@ -5,7 +5,13 @@ Common fetch utilities for benchmark implementations.
 
 This module provides reusable helper functions for typical benchmark fetch operations:
 - git_clone: Clone Git repositories with commit checkout
+- git_init: Initialize Git repositories with commit checkout
+- git_apply_patches: Apply patches to Git repositories
 - curl : Download files or fetch remote resources over HTTP(S), FTP, and related protocols
+- sed : Apply in-place text substitutions/patches to files
+- tar : Extract tar archives (e.g., .tar, .tar.gz, .tgz) on the target machine
+- fuseiso_mount: Mount ISO disk images to the target machine without root
+- fuseiso_umount: Unmount ISO disk images from the target machine without root
 
 These utilities reduce code duplication across benchmark implementations and provide
 sensible defaults (e.g., git clone).
@@ -50,6 +56,7 @@ def git_clone(
     """
     platform = ctx.platform
     comm = platform.comm
+    parent_dir = comm.host_to_comm_path(host_path=parent_dir)
     name = url.split("/")[-1].split(".")[0]
     dest = parent_dir / name
 
@@ -64,22 +71,92 @@ def git_clone(
         ctx.exec(argv=["git", "checkout", f"{commit}"], cwd=dest)
 
     if not exists:
-        for patch in patches:
-            # TODO: This currently assumes patch files are present on the target machine.
-            # Check that the patch exists on the target machine
-            if not comm.isfile(patch):
-                raise FileNotFoundError(
-                    f"Patch file not found on target machine: {patch}. "
-                    "Applying patches currently assumes patches are available "
-                    "locally on the target comm."
-                )
-
-            ctx.exec(
-                argv=["git", "apply", f"{patch}"],
-                cwd=dest,
-            )
+        if patches:
+            git_apply_patches(ctx=ctx, repo_dir=dest, patches=patches)
 
     return dest
+
+
+def git_init(
+    ctx: BaseContext,
+    repo_dir: Path,
+    initial_branch: str | None = None,
+) -> Path:
+    """
+    Initialize a Git repository on the target machine.
+
+    Creates the repository directory if it does not exist and runs
+    `git init` inside it. Optionally sets the initial branch name.
+
+    Args:
+        ctx: Context providing platform and execution capabilities.
+        repo_dir: Path where the Git repository should be initialized.
+        initial_branch: Optional initial branch name
+                        (e.g., "main", "master").
+
+    Returns:
+        Path to the initialized Git repository directory.
+
+    Example:
+        >>> repo_dir = git_init(
+        ...     ctx=fetch_ctx,
+        ...     repo_dir=Path("/tmp/myrepo"),
+        ...     initial_branch="main",
+        ... )
+    """
+    platform = ctx.platform
+    comm = platform.comm
+
+    if not comm.isdir(repo_dir):
+        comm.makedirs(path=repo_dir, exist_ok=True)
+
+    argv = ["git", "init"]
+    if initial_branch:
+        argv.extend(["--initial-branch", initial_branch])
+
+    ctx.exec(
+        argv=argv,
+        cwd=repo_dir,
+    )
+
+    return repo_dir
+
+
+def git_apply_patches(
+    ctx: BaseContext,
+    repo_dir: Path,
+    patches: Iterable[Path] = (),
+) -> None:
+    """
+    Apply Git patches to a repository on the target machine.
+
+    Args:
+        ctx: Context providing platform and execution capabilities.
+        repo_dir: Path to the git repository where patches should be applied.
+        patches: Iterable of patch file paths to apply.
+
+    Raises:
+        FileNotFoundError: If a patch file does not exist on the target machine.
+    """
+    platform = ctx.platform
+    comm = platform.comm
+
+    repo_dir = Path(repo_dir)
+    for patch in patches:
+        comm_patch = comm.host_to_comm_path(host_path=patch)
+        if not comm.isfile(comm_patch):
+            # The patch lives on the orchestrator, not the target (e.g. a fresh
+            # remote board). Stage it next to the benches dir under
+            # _patches/<repo-name>/<patch-name>, then apply from there.
+            staged_dir = repo_dir.parent / "_patches" / repo_dir.name
+            comm.makedirs(path=staged_dir, exist_ok=True)
+            comm_patch = staged_dir / Path(patch).name
+            comm.copy_from_host(source=patch, destination=comm_patch)
+
+        ctx.exec(
+            argv=["git", "apply", str(comm_patch)],
+            cwd=repo_dir,
+        )
 
 
 def curl(
@@ -124,3 +201,169 @@ def curl(
         ctx.exec(argv=["curl", "-o", f"{dest}", f"{url}"], cwd=parent_dir)
 
     return dest
+
+
+def sed_edit(
+    ctx: BaseContext,
+    base_dir: Path,
+    edits: Iterable[tuple[str, Path]],
+) -> None:
+    """
+    Apply in-place sed edits to files on the target machine.
+
+    Each edit is applied using `sed -i` without invoking a shell. All target
+    files must already exist on the target machine.
+
+    Args:
+        ctx: Context providing platform and execution capabilities.
+        base_dir: Base directory relative to which target file paths are resolved.
+        edits: Iterable of (sed_expression, relative_file_path) pairs.
+
+    Raises:
+        FileNotFoundError: If any target file does not exist on the target machine.
+
+    Example:
+        >>> sed_edit(
+        ...     ctx=fetch_ctx,
+        ...     base_dir=volano_dir,
+        ...     edits=[
+        ...         ("s/host=[^ ]*/host=localhost/", Path("startup.sh")),
+        ...         ("/# Quit if we cannot find the Java executable file./i java=$(which java)",
+        ...             Path("startup.sh")),
+        ...     ],
+        ... )
+    """
+    platform = ctx.platform
+    comm = platform.comm
+
+    for expr, relpath in edits:
+        target = base_dir / relpath
+
+        if not comm.isfile(target):
+            raise FileNotFoundError(f"sed target file not found on target machine: {target}")
+
+        ctx.exec(
+            argv=["sed", "-i", expr, str(relpath)],
+            cwd=base_dir,
+        )
+
+
+def tar_extract(
+    ctx: BaseContext,
+    archive: Path,
+    parent_dir: Path | None = None,
+) -> Path:
+    """
+    Extract a tar archive on the target machine.
+
+    Uses `tar -xf` to extract the given archive. By default, extraction
+    happens in the archive's parent directory.
+
+    Args:
+        ctx: Context providing platform and execution capabilities.
+        archive: Path to the tar archive on the target machine
+                 (e.g., "kyotocabinet-1.2.76.tar.gz").
+        parent_dir: Directory to extract into (default: archive.parent).
+
+    Returns:
+        Path to the directory where the archive was extracted.
+
+    Raises:
+        FileNotFoundError: If the archive does not exist on the target machine.
+
+    Example:
+        >>> src_dir = tar_extract(
+        ...     ctx=fetch_ctx,
+        ...     archive=Path("kyotocabinet-1.2.76.tar.gz"),
+        ... )
+    """
+    platform = ctx.platform
+    comm = platform.comm
+
+    if not comm.isfile(archive):
+        raise FileNotFoundError(f"Tar archive not found on target machine: {archive}")
+
+    extract_dir = parent_dir if parent_dir is not None else archive.parent
+
+    if not comm.isdir(extract_dir):
+        comm.makedirs(path=extract_dir, exist_ok=True)
+
+    ctx.exec(
+        argv=["tar", "-xf", str(archive)],
+        cwd=extract_dir,
+    )
+
+    return extract_dir
+
+
+def fuseiso_mount(
+    ctx: BaseContext,
+    image: Path,
+    mount_point: Path,
+    read_only: bool = True,  # kept for API symmetry
+) -> Path:
+    """
+    Mount an ISO image using fuseiso (no root required).
+
+    This helper uses FUSE to mount ISO9660 images as a regular user.
+    The mount can be removed with `fusermount -u`.
+
+    Args:
+        ctx: Context providing platform and execution capabilities.
+        image: Path to the ISO image on the target machine.
+        mount_point: Directory where the ISO should be mounted.
+        read_only: Ignored (fuseiso mounts read-only by default).
+
+    Returns:
+        Path to the mount point.
+
+    Raises:
+        FileNotFoundError: If the ISO image does not exist.
+    """
+    platform = ctx.platform
+    comm = platform.comm
+
+    if not comm.isfile(image):
+        raise FileNotFoundError(f"ISO image not found on target machine: {image}")
+
+    if not comm.isdir(mount_point):
+        comm.makedirs(path=mount_point, exist_ok=True)
+
+    # fuseiso is read-only by nature
+    ctx.exec(
+        argv=["fuseiso", str(image), str(mount_point)],
+        cwd=mount_point,
+    )
+
+    return mount_point
+
+
+def fuseiso_umount(
+    ctx: BaseContext,
+    mount_point: Path,
+) -> None:
+    """
+    Unmount a FUSE-mounted ISO filesystem.
+
+    Unmounts a filesystem previously mounted with `fuseiso` using
+    `fusermount -u`. This operation does not require superuser
+    privileges and works for user-space FUSE mounts.
+
+    Args:
+        ctx: Context providing platform and execution capabilities.
+        mount_point: Directory where the ISO filesystem is mounted.
+
+    Raises:
+        subprocess.CalledProcessError: If the unmount operation fails
+            (e.g., if the mount point is not a FUSE mount or is busy).
+
+    Example:
+        >>> fuseiso_umount(
+        ...     ctx=fetch_ctx,
+        ...     mount_point=Path("/tmp/alpine-iso"),
+        ... )
+    """
+    ctx.exec(
+        argv=["fusermount", "-u", str(mount_point)],
+        cwd=mount_point,
+    )

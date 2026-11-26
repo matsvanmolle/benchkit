@@ -14,6 +14,12 @@ Each context provides:
 - Execution function for running commands
 - Variables and results from previous phases
 - A call() method to invoke benchmark methods with automatic argument filtering
+
+The ``record_dir`` field is present on every context (inherited from
+BaseContext) and defaults to ``None``.  Currently only RunContext and
+CollectContext receive a meaningful value (the per-run data directory),
+set by the engine or compatibility layer.  In the future, FetchContext
+and BuildContext may also receive appropriate paths (see ROADMAP).
 """
 
 import inspect
@@ -36,7 +42,8 @@ class BaseContext:
         platform: Platform information (OS, architecture, communication interface).
         exec: Function for executing commands synchronously.
         vars: Dictionary of arbitrary benchmark variables shared across phases.
-        record_dir: Optional directory for storing execution artifacts and logs.
+        record_dir: Directory for storing artifacts.  ``None`` for fetch/build
+                    (for now); set to the per-run data directory for run/collect.
     """
 
     platform: Platform = get_current_platform()
@@ -68,7 +75,6 @@ class FetchContext(BaseContext):
         default_args: Vars | None = None,
         platform: Platform | None = None,
         exec_fn: ExecFn | None = None,
-        record_dir: Path | None = None,
     ) -> "FetchContext":
         """
         Create a FetchContext from fetch arguments.
@@ -79,7 +85,6 @@ class FetchContext(BaseContext):
             default_args: Optional default arguments for all benchmark phases.
             platform: Optional platform override (defaults to current platform).
             exec_fn: Optional execution function override.
-            record_dir: Optional directory for storing artifacts.
 
         Returns:
             A FetchContext instance ready for use.
@@ -91,7 +96,6 @@ class FetchContext(BaseContext):
             exec=exec_fn,
             vars=vars or dict(fetch_args),
             default_args=default_args or {},
-            record_dir=record_dir,
             fetch_args=fetch_args,
         )
 
@@ -142,6 +146,7 @@ class BuildContext(BaseContext):
             ctx: The FetchContext from the previous phase.
             fetch_result: The result returned by the fetch phase.
             build_args: Build-specific arguments (e.g., compiler, optimization level).
+            default_args: Optional default arguments.
 
         Returns:
             A BuildContext instance ready for building.
@@ -151,7 +156,6 @@ class BuildContext(BaseContext):
             exec=ctx.exec,
             vars=ctx.vars,
             default_args=ctx.default_args | (default_args or {}),
-            record_dir=ctx.record_dir,
             fetch_args=ctx.fetch_args,
             fetch_result=fetch_result,
             build_args=build_args,
@@ -203,6 +207,7 @@ class RunContext(BaseContext):
         run_args: Vars,
         default_args: Vars | None = None,
         duration_s: int | None = None,
+        record_dir: Path | None = None,
     ) -> "RunContext":
         """
         Create a RunContext from a completed build phase.
@@ -211,7 +216,9 @@ class RunContext(BaseContext):
             ctx: The BuildContext from the previous phase.
             build_result: The result returned by the build phase.
             run_args: Run-specific arguments (e.g., benchmark name, thread count).
+            default_args: Optional default arguments.
             duration_s: Optional duration limit in seconds.
+            record_dir: Optional per-run directory for storing artifacts.
 
         Returns:
             A RunContext instance ready for execution.
@@ -221,13 +228,13 @@ class RunContext(BaseContext):
             exec=ctx.exec,
             vars=ctx.vars,
             default_args=ctx.default_args | (default_args or {}),
-            record_dir=ctx.record_dir,
             fetch_args=ctx.fetch_args,
             fetch_result=ctx.fetch_result,
             build_args=ctx.build_args,
             build_result=build_result,
             run_args=run_args,
             duration_s=duration_s,
+            record_dir=record_dir,
         )
 
     def call(self, fn: Callable) -> RunResult:

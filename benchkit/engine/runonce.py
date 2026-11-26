@@ -24,6 +24,7 @@ from benchkit.core.validatebench import validate_benchmark
 from benchkit.engine.executor import LocalExecutor
 from benchkit.engine.stepper import Stepper
 from benchkit.platforms import get_current_platform
+from benchkit.utils.dir import get_results_dir
 from benchkit.utils.logging import get_logger
 
 
@@ -52,17 +53,20 @@ class RunOnceEngine:
     ) -> RecordResult:
         log = get_logger("engine.runonce")
         validate_benchmark(bench=bench)
+        record_dir = get_results_dir(results_dir=record_dir)
 
         platform = get_current_platform()
 
         log.debug("Starting benchmark.")
         stepper = Stepper(bench=bench, platform=platform)
         log.debug("Fetching...")
-        session = stepper.fetch(args=args, record_dir=record_dir)
+        session = stepper.fetch(args=args)
         log.debug("Building...")
         session = stepper.build(session=session, args=args)
         log.debug("Running...")
-        session = stepper.run(session=session, args=args, duration_s=duration_s)
+        session = stepper.run(
+            session=session, args=args, duration_s=duration_s, record_dir=record_dir
+        )
         log.debug("Collecting...")
         session = stepper.collect(session=session, args=args)
         log.debug("Benchmark completed.")

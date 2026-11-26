@@ -30,6 +30,8 @@ from benchkit.core.bktypes.callresults import BuildResult, FetchResult, RunResul
 from benchkit.core.bktypes.contexts import BuildContext, CollectContext, FetchContext, RunContext
 from benchkit.platforms import Platform
 
+RunCtxTransform = Callable[[RunContext], RunContext]
+
 
 class MissingStepArgError(ValueError):
     """
@@ -61,9 +63,9 @@ class StepSession:
 
 def _get_step_args(
     step_fn: Callable,
-    step_name: str,
     args: Vars,
 ) -> tuple[Vars, Vars]:
+    step_name = step_fn.__name__
     sig = inspect.signature(step_fn)
     sig_params = sig.parameters
     params = list(sig_params.keys())
@@ -86,8 +88,8 @@ def _get_step_args(
     if missing_args:
         provided = ""
         if args:
-            provided = ", ".join(f'{k} ("{v}")' for k, v in args.items())
-            provided = f"Provided: {provided}."
+            provided = "\n".join(f'- {k} ("{v}")' for k, v in args.items())
+            provided = f" Provided: \n{provided}."
         raise MissingStepArgError(
             f"Missing required arguments in {step_name}(): {', '.join(missing_args)}.{provided}"
         )
@@ -104,7 +106,6 @@ class Stepper:
     def fetch(
         self,
         args: Vars,
-        record_dir: Path | None = None,
     ) -> StepSession:
         do_fetch = hasattr(self.bench, "fetch")
         fetch_args = {}
@@ -114,7 +115,6 @@ class Stepper:
         if do_fetch:
             fetch_args, default_args = _get_step_args(
                 step_fn=self.bench.fetch,
-                step_name="fetch",
                 args=args,
             )
 
@@ -123,7 +123,6 @@ class Stepper:
             vars=args,
             default_args=default_args,
             platform=self.platform,
-            record_dir=record_dir,
         )
         if do_fetch:
             fetch_result = fetch_context.call(self.bench.fetch)
@@ -140,7 +139,6 @@ class Stepper:
         if do_build:
             build_args, default_args = _get_step_args(
                 step_fn=self.bench.build,
-                step_name="build",
                 args=args,
             )
 
@@ -162,15 +160,28 @@ class Stepper:
         )
         return result
 
-    def run(self, session: StepSession, args: Vars, duration_s: int | None) -> StepSession:
-        run_args, default_args = _get_step_args(step_fn=self.bench.run, step_name="run", args=args)
+    def run(
+        self,
+        session: StepSession,
+        args: Vars,
+        duration_s: int | None,
+        *,
+        record_dir: Path | None = None,
+        ctx_transform: RunCtxTransform | None = None,
+    ) -> StepSession:
+        run_args, default_args = _get_step_args(step_fn=self.bench.run, args=args)
         run_ctx = RunContext.from_build(
             ctx=session.build_ctx,
             build_result=session.build_result,
             run_args=run_args,
             default_args=default_args,
             duration_s=duration_s,
+            record_dir=record_dir,
         )
+
+        if ctx_transform is not None:
+            run_ctx = ctx_transform(run_ctx)
+
         run_result = run_ctx.call(self.bench.run)
         result = StepSession(
             fetch_ctx=session.fetch_ctx,
@@ -191,7 +202,6 @@ class Stepper:
         if do_collect:
             collect_args, default_args = _get_step_args(
                 step_fn=self.bench.collect,
-                step_name="collect",
                 args=args,
             )
 

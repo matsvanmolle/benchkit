@@ -55,6 +55,8 @@ future.
     - ref: https://lmbench.sourceforge.net/why_lmbench.html
 [ ] https://github.com/eembc/coremark
 [ ] https://sites.google.com/view/parvecbenchmarksuite/ of Magnus
+[ ] rtesbench: A Multi-core Benchmark Framework for Real-Time Embedded Systems
+    https://dl.acm.org/doi/10.1145/3735452.3735521
 
 ## Functional changes
 
@@ -174,6 +176,17 @@ future.
 
 - Refactor logging
 
+- Hierarchical record_dir across all phases:
+  currently record_dir is only set on RunContext/CollectContext (the per-run
+  data directory). When the new API is finalized, extend record_dir to
+  FetchContext (results root) and BuildContext (build-variable subdirectory),
+  so each phase can store artifacts at the appropriate level in the hierarchy.
+  Example:
+    - FetchContext:   results/
+    - BuildContext:   results/build_type-Release/
+    - RunContext:     results/build_type-Release/bench_name-readrandom/nb_threads-4/run-01/
+    - CollectContext: (same as RunContext, inherited)
+
 - Save stdout, stderr of command in the record hierarchy and put additional
   information in the record:
   - The json file with the record, detailing input, output and perf values
@@ -246,6 +259,9 @@ future.
 
 - perf with python?
   https://www.phoronix.com/news/Linux-6.18-Perf-Tools
+
+- consider uv for package system
+  https://nesbitt.io/2025/12/26/how-uv-got-so-fast.html
 
 ## Documentation
 

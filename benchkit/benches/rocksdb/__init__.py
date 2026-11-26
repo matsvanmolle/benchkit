@@ -70,6 +70,7 @@ from benchkit.core.bktypes.callresults import BuildResult, FetchResult, RunResul
 from benchkit.core.bktypes.contexts import BuildContext, CollectContext, FetchContext, RunContext
 from benchkit.dependencies.packages import PackageDependency
 from benchkit.utils.buildtools import build_dir_from_ctx, make
+from benchkit.utils.dir import get_benches_dir
 from benchkit.utils.fetchtools import git_clone
 
 
@@ -87,8 +88,8 @@ class RocksDBBench:
     def fetch(
         self,
         ctx: FetchContext,
-        parent_dir: Path,
-        commit: str = "",
+        parent_dir: Path | None = None,
+        commit: str = "v10.7.5",
     ) -> FetchResult:
         """
         Fetch RocksDB source code from GitHub.
@@ -105,6 +106,8 @@ class RocksDBBench:
         Returns:
             FetchResult containing the path to the cloned repository.
         """
+        parent_dir = get_benches_dir(parent_dir=parent_dir, comm=ctx.platform.comm)
+
         rocksdb_dir = git_clone(
             ctx=ctx,
             url="https://github.com/facebook/rocksdb.git",

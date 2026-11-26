@@ -9,33 +9,30 @@ import itertools
 import json
 import os
 import pathlib
-from multiprocessing import Barrier
 from subprocess import CalledProcessError
-from typing import IO, Any, Dict, Iterable, List, Optional, Protocol, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple, Type
 
 from benchkit.commandwrappers import CommandWrapper
 from benchkit.dependencies import check_dependencies
 from benchkit.dependencies.packages import PackageDependency
+from benchkit.engine.stores import ResultStore
 from benchkit.platforms import get_current_platform
 from benchkit.sharedlibs import SharedLib
-from benchkit.sharedlibs.tiltlib import TiltLib
 from benchkit.shell.shellasync import AsyncProcess, shell_async
 from benchkit.utils.gdb import generate_gdb_script_from_cmd
+from benchkit.utils.json_encoders import MultipleJsonEncoders, PathEncoder
 from benchkit.utils.misc import (
-    CSV_SEPARATOR,
     TimeMeasure,
     dict_union,
     get_benchkit_temp_folder_str,
     seconds2pretty,
 )
 from benchkit.utils.system import get_boot_args
-from benchkit.utils.tee import teeprint
 from benchkit.utils.types import (
     Command,
     Constants,
     Environment,
     PathType,
-    Pretty,
     SplitCommand,
 )
 from benchkit.utils.variables import list_groupby
@@ -111,40 +108,34 @@ class Benchmark:
         shared_libs: Iterable[SharedLib],
         pre_run_hooks: Iterable[PreRunHook],
         post_run_hooks: Iterable[PostRunHook],
+        encoders: list[Type[json.JSONEncoder]] = [PathEncoder],
     ) -> None:
-        # TODO tilt is still hardcoded for now, remove tilt from the base benchmark class
-        tilts = [lib for lib in shared_libs if isinstance(lib, TiltLib)]
-        tilt = tilts[0] if tilts else None
-
         self._command_wrappers = command_wrappers
         self._command_attachments = list(command_attachments)
         self._shared_libs = shared_libs
         self._pre_run_hooks = pre_run_hooks
         self._post_run_hooks = post_run_hooks
 
-        self.tilt = tilt
         self.platform = get_current_platform()
 
         self._configured = False
         self._experiment_name = None
         self._benchmark_name = None
-        self._csv_output_path = None
+        self._result_store = None
         self._base_data_dir = None
         self._benchmark_duration_seconds = None
         self._nb_runs = None
         self._variables = None
         self._other_campaigns_seconds = None
-        self._use_tilt = None
         self._constants = None
-        self._pretty_variables = None
 
         self._total_nb_runs = None
         self._nb_runs_done = 0
-        self._first_line_is_printed = False
 
         self._debug = False
         self._gdb = False
         self._flamegraph_path: Optional[PathType] = None
+        self._encoders: MultipleJsonEncoders = MultipleJsonEncoders(encoders=encoders)
 
     @property
     def bench_src_path(self) -> pathlib.Path:
@@ -177,16 +168,6 @@ class Benchmark:
         raise NotImplementedError
 
     @staticmethod
-    def get_tilt_var_names() -> List[str]:
-        """
-        Get the names of the tilt variables.
-
-        Returns:
-            List[str]: the names of the tilt variables.
-        """
-        raise NotImplementedError
-
-    @staticmethod
     def _write_to_record_data_dir(
         file_content: str,
         filename: PathType,
@@ -199,32 +180,6 @@ class Benchmark:
         output_path = rdd / filename
         with open(output_path, "w") as output_file:
             output_file.write(file_content)
-
-    @staticmethod
-    def _log_footers(
-        output_file: IO[str],
-        total_duration_seconds: float,
-    ) -> None:
-        def log_line(line: str) -> None:
-            print(f"# {line}", file=output_file)
-            output_file.flush()
-
-        total_duration_pretty = seconds2pretty(total_duration_seconds)
-        log_line(f"total_duration_seconds: {total_duration_seconds}")
-        log_line(f"total_duration_pretty: {total_duration_pretty}")
-
-    @staticmethod
-    def _log_prebuild_time(
-        output_file: IO[str],
-        prebuild_seconds: float,
-    ) -> None:
-        def log_line(line: str) -> None:
-            print(f"# {line}", file=output_file)
-            output_file.flush()
-
-        prebuild_duration_pretty = seconds2pretty(prebuild_seconds)
-        log_line(f"prebuild_duration_seconds: {prebuild_seconds}")
-        log_line(f"prebuild_duration_pretty: {prebuild_duration_pretty}")
 
     @staticmethod
     def _log_total_time_info(
@@ -295,13 +250,12 @@ class Benchmark:
         self,
         experiment_name: str,
         benchmark_name: str,
-        csv_output_path: PathType,
+        result_store: ResultStore,
         base_data_dir: Optional[PathType],
         benchmark_duration_seconds: int,
         nb_runs: int,
         constants: Constants,
         variables: RecordParameters,
-        pretty_variables: Pretty,
         debug: bool,
         gdb: bool,
     ) -> None:
@@ -313,8 +267,8 @@ class Benchmark:
                 name of the experiment.
             benchmark_name (str):
                 name of the benchmark.
-            csv_output_path (PathType):
-                path of the CSV output file.
+            result_store (ResultStore):
+                store that persists the records produced by the benchmark.
             base_data_dir (Optional[PathType]):
                 path of the base data directory, where to store the data of each record.
                 This step is ignored if None is given.
@@ -327,8 +281,6 @@ class Benchmark:
                 constant columns to add to the results.
             variables (RecordParameters):
                 records that map the variable names to the variable values.
-            pretty_variables (Pretty):
-                pretty translation of variable values.
             debug (bool):
                 whether to enable debug.
             gdb (bool):
@@ -343,16 +295,12 @@ class Benchmark:
         self._configured = True
         self._experiment_name = experiment_name
         self._benchmark_name = benchmark_name
-        self._csv_output_path = pathlib.Path(csv_output_path)
+        self._result_store = result_store
         self._base_data_dir = pathlib.Path(base_data_dir) if base_data_dir is not None else None
         self._benchmark_duration_seconds = benchmark_duration_seconds
         self._nb_runs = nb_runs
         self._constants = constants
         self._variables = variables
-
-        self._use_tilt = self.tilt is not None
-
-        self._pretty_variables = pretty_variables
 
         self._debug = debug
         self._gdb = gdb
@@ -396,13 +344,14 @@ class Benchmark:
             nb_cases = 0
 
             for record_params in self._variables:
-                build_variables, run_variables, _, _ = self._group_record_parameters(
+                build_variables, run_variables, other_variables = self._group_record_parameters(
                     record_parameters=record_params,
                 )
 
                 experiment_point = {}
                 experiment_point.update(build_variables)
                 experiment_point.update(run_variables)
+                experiment_point.update(other_variables)
 
                 is_valid_point = self.valid_experiment_parameters(**experiment_point)
                 if is_valid_point:
@@ -430,43 +379,6 @@ class Benchmark:
         bds = self._benchmark_duration_seconds
         result = self.total_nb_runs() * bds
         return result
-
-    def get_execution_set(
-        self,
-        continuing: bool,
-    ) -> Tuple[List[Dict[str, str]], bool]:
-        """
-        Return the set of executions.
-
-        Args:
-            continuing (bool): whether caching of the results is enabled.
-
-        Returns:
-            Tuple[List[Dict[str, str]], bool]:
-                the execution set and whether to print comments (in the CSV header).
-        """
-        if not continuing or not self._csv_output_path.exists():
-            return [], True
-
-        with open(self._csv_output_path, "r") as csv_output_file:
-            output_executions = [
-                line.strip()
-                for line in csv_output_file.readlines()
-                if not line.strip().startswith("#")
-            ]
-
-            if len(output_executions) > 0:
-                print_comments = False
-                header = output_executions[0]
-                records_lines = output_executions[1:]
-
-                keys = header.split(";")
-                records = [dict(zip(keys, record_line.split(";"))) for record_line in records_lines]
-            else:
-                print_comments = True
-                records = []
-
-        return records, print_comments
 
     def filter_result_execution_set(
         self,
@@ -505,7 +417,6 @@ class Benchmark:
     def run(
         self,
         other_campaigns_seconds: int,
-        barrier: Optional[Barrier],
         continuing: bool,
     ) -> None:
         """
@@ -514,8 +425,6 @@ class Benchmark:
         Args:
             other_campaigns_seconds (int):
                 how many seconds remain in other campaigns (that are run sequentially).
-            barrier (Optional[Barrier]):
-                in case it is necessary to synchronize the start, the associated barrier.
             continuing (bool):
                 whether caching of results is enabled.
         """
@@ -524,15 +433,6 @@ class Benchmark:
         self._other_campaigns_seconds = other_campaigns_seconds
 
         self._configure_shared_libs()
-
-        if self._use_tilt:
-            self.tilt.clean()
-            tilt_gb = list_groupby(
-                variables_names=self.get_tilt_var_names(),
-                bench_variables=self._variables,
-            )
-            for tilt_variables, _ in tilt_gb:
-                self.build_tilt(**tilt_variables)
 
         prebuild_seconds = self.prebuild_bench(
             benchmark_duration_seconds=self._benchmark_duration_seconds,
@@ -546,26 +446,17 @@ class Benchmark:
         )
 
         with TimeMeasure() as run_duration:
-            executions_dict, print_comments_header = self.get_execution_set(continuing)
+            executions_dict = self._result_store.existing_records() if continuing else []
 
-            if print_comments_header:
-                with open(self._csv_output_path, "a") as csv_output_file:
-                    self._log_headers(
-                        output_file=csv_output_file,
-                        experiment_name=self._experiment_name,
-                        benchmark_duration_seconds=self._benchmark_duration_seconds,
-                        nb_runs=self._nb_runs,
-                        start_time=run_duration.start_time,
-                        expected_duration_seconds=expected_total_seconds,
-                    )
-                    if prebuild_seconds is not None:
-                        self._log_prebuild_time(
-                            output_file=csv_output_file,
-                            prebuild_seconds=prebuild_seconds,
-                        )
+            self._result_store.begin(
+                metadata=self._campaign_metadata(
+                    start_time=run_duration.start_time,
+                    expected_duration_seconds=expected_total_seconds,
+                    prebuild_seconds=prebuild_seconds,
+                )
+            )
 
             self._nb_runs_done = 0
-            self._first_line_is_printed = False
 
             build_gb = list_groupby(
                 variables_names=self.get_build_var_names(),
@@ -594,27 +485,20 @@ class Benchmark:
                             record_parameters=record_params,
                             executions_dict=executions_dict,
                             continuing=continuing,
-                            barrier=barrier,
                         )
 
         actual_total_seconds = run_duration.duration_seconds
 
-        with open(self._csv_output_path, "a") as csv_output_file:
-            self._log_footers(
-                output_file=csv_output_file,
-                total_duration_seconds=actual_total_seconds,
-            )
+        self._result_store.end(
+            metadata={
+                "total_duration_seconds": actual_total_seconds,
+                "total_duration_pretty": seconds2pretty(actual_total_seconds),
+            }
+        )
 
-        print(f"[INFO] Benchmark done. " f'Results are stored in: "{self._csv_output_path}"')
-
-    def build_tilt(
-        self,
-        **kwargs,
-    ) -> None:
-        """
-        Build the tilt library related to this benchmark.
-        TODO this is deprecated, now benchmark is independent from tilt
-        """
+        csv_path = getattr(self._result_store, "csv_path", None)
+        location = f' Results are stored in: "{csv_path}"' if csv_path is not None else ""
+        print(f"[INFO] Benchmark done.{location}")
 
     def prebuild_bench(
         self,
@@ -807,11 +691,6 @@ class Benchmark:
         )
         raise SystemExit(0)
 
-    def _max_nb_threads(self) -> int:
-        # we allow over-subscription
-        result = 4 * self.platform.nb_cpus()
-        return result
-
     def _parallel_make_str(self) -> str:
         nb_active_cpus = self.platform.nb_active_cpus()
         parallel_make_str = f" -j {nb_active_cpus} " if nb_active_cpus > 1 else ""
@@ -900,16 +779,16 @@ class Benchmark:
     def _group_record_parameters(
         self,
         record_parameters: Dict[str, Any],
-    ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
         """
-        Partition the record parameters into build/run/tilt/other variable groups.
+        Partition the record parameters into build/run/other variable groups.
 
         Args:
             record_parameters (Dict[str, Any]): parameters to split.
 
         Returns:
-            Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
-                split parameters (build/run/tilt/other).
+            Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+                split parameters (build/run/other).
         """
         build_variables = {
             k: record_parameters[k] for k in self.get_build_var_names() if k in record_parameters
@@ -917,17 +796,12 @@ class Benchmark:
         run_variables = {
             k: record_parameters[k] for k in self.get_run_var_names() if k in record_parameters
         }
-        tilt_variables = (
-            {k: record_parameters[k] for k in self.get_tilt_var_names() if k in record_parameters}
-            if self._use_tilt
-            else {}
-        )
         other_variables = {
             k: record_parameters[k]
             for k in record_parameters
             if k not in build_variables and k not in run_variables
         }
-        return build_variables, run_variables, tilt_variables, other_variables
+        return build_variables, run_variables, other_variables
 
     def _is_result_cached(
         self,
@@ -961,7 +835,6 @@ class Benchmark:
         record_parameters: Dict[str, Any],
         executions_dict: Iterable[Dict[str, str]],
         continuing: bool,
-        barrier: Optional[Barrier],
     ) -> None:
         """
         Run `nb_runs` times a single instance of the benchmark using the given record parameters.
@@ -973,13 +846,10 @@ class Benchmark:
                 current information that need to be stored in the record.
             continuing (bool):
                 whether caching of the results is enabled.
-            barrier (Optional[Barrier]):
-                if applicable, the barrier for the benchmark to wait.
         """
         (
             build_variables,
             run_variables,
-            _,  # tilt_variables, TODO remove tilt
             other_variables,
         ) = self._group_record_parameters(record_parameters=record_parameters)
 
@@ -998,13 +868,6 @@ class Benchmark:
             experiment_results.update(build_variables)
             experiment_results.update(run_variables)
             experiment_results.update(other_variables)
-
-            if self._pretty_variables:
-                for var_name in self._pretty_variables:
-                    ugly2pretty = self._pretty_variables[var_name]
-                    ugly_var_value = experiment_results.get(var_name)
-                    pretty_var_value = ugly2pretty.get(ugly_var_value, ugly_var_value)
-                    experiment_results[f"{var_name}_pretty"] = f'"{pretty_var_value}"'
 
             experiment_results.update({"rep": run_id})
 
@@ -1030,10 +893,6 @@ class Benchmark:
             if continuing and self._is_result_cached(execution_parameters, executions_dict):
                 print("[CONTINUING] This execution has already been done. Skipping it")
                 self._nb_runs_done += 1
-                if not self._first_line_is_printed:
-                    self._first_line_is_printed = True
-                    with open(self._csv_output_path, "a") as csv_output_file:
-                        teeprint(content="# Continuing campaign execution", file=csv_output_file)
                 continue
 
             # Replace record_data_dir with a temporary data directory for the
@@ -1057,11 +916,6 @@ class Benchmark:
                     other_variables=other_variables,
                     record_data_dir=temp_record_data_dir,
                 )
-
-            if barrier is not None:
-                barrier_ret = barrier.wait()
-                if barrier_ret == 0:
-                    barrier.reset()
 
             single_run_return = self.single_run(
                 platform=self.platform,
@@ -1104,14 +958,18 @@ class Benchmark:
             experiment_results_header = experiment_results
 
             if isinstance(single_run_results, list):
-                # multi-line output record
-                experiment_results_lines = []
-                for line in single_run_results:
-                    experiment_results_lines.append(dict_union(experiment_results_header, line))
-            else:
-                # single-line output record
-                record_params_results = dict_union(experiment_results_header, single_run_results)
-                experiment_results_lines = [record_params_results]
+                # One run produces one record: multi-line results are gone.
+                # Per-line data (per-thread stats, time series, ...) belongs in
+                # files inside record_data_dir; the returned record holds the
+                # aggregates (see e.g. the cyclictest example).
+                raise ValueError(
+                    "parse_output_to_results() returned a list; one run must produce exactly "
+                    "one record. Return the record dict directly, and write per-line data "
+                    "into files in record_data_dir."
+                )
+
+            record_params_results = dict_union(experiment_results_header, single_run_results)
+            experiment_results_lines = [record_params_results]
 
             for post_run_hook in self._post_run_hooks:
                 hook_dict = post_run_hook(
@@ -1123,47 +981,42 @@ class Benchmark:
                     for xrline in experiment_results_lines:
                         xrline.update(hook_dict)
 
-            wrdr(
-                file_content=json.dumps(experiment_results_lines, indent=4).strip() + "\n",
-                filename="experiment_results.json",
+            # Hooks see the legacy merged line (base parameters + output);
+            # the store receives the roles separately. Anything a hook added
+            # on top of the base parameters is an output (see the board issue
+            # on role declaration for wrapper/hook-provided inputs).
+            base_keys = set(experiment_results_header)
+            (merged_line,) = experiment_results_lines
+            outputs = {k: v for k, v in merged_line.items() if k not in base_keys}
+
+            self._result_store.write_record(
+                identity={
+                    "experiment_name": self._experiment_name,
+                    "benchmark_name": self._benchmark_name,
+                },
+                constants=dict(self._constants) if self._constants else {},
+                inputs={**build_variables, **run_variables, **other_variables},
+                rep=run_id,
+                outputs=outputs,
+                record_data_dir=record_data_dir,
             )
 
-            with open(self._csv_output_path, "a") as csv_output_file:
-                for experiment_results_line in experiment_results_lines:
-                    sep = CSV_SEPARATOR
-                    if not self._first_line_is_printed:
-                        header_list = list(experiment_results_line.keys())
-                        current_thread_columns = [
-                            int(c.split("thread_")[-1])
-                            for c in header_list
-                            if c.startswith("thread_")
-                        ]
+            # Live progress: one concise line per record (identity/constants
+            # are static per campaign and stay out of the way).
+            result_fields = {**build_variables, **run_variables, **other_variables}
+            result_fields["rep"] = run_id
+            result_fields.update(outputs)
 
-                        thread_list = []
-                        if len(current_thread_columns) > 0:
-                            current_max_thread = max(current_thread_columns)
-                            thread_list = [
-                                f"thread_{t}"
-                                for t in range(current_max_thread + 1, self._max_nb_threads())
-                            ]
-                        header_unsorted = header_list + thread_list
-                        header_left = [e for e in header_unsorted if not e.startswith("thread_")]
-                        header_right = [e for e in header_unsorted if e.startswith("thread_")]
-                        header = sep.join(header_left + header_right)
+            def fmt_value(value: Any) -> str:
+                # Human-eyes format: common values stay bare; anything with
+                # whitespace or quotes is repr'd so nested quotes stay readable.
+                value_str = str(value)
+                if any(c.isspace() for c in value_str) or "'" in value_str or '"' in value_str:
+                    return repr(value_str)
+                return value_str
 
-                        teeprint(content=header, file=csv_output_file)
-                        self._first_line_is_printed = True
-                        self._first_line_list = header_list
-
-                    line_keys_left = [
-                        k for k in experiment_results_line.keys() if not k.startswith("thread_")
-                    ]
-                    line_keys_right = [
-                        k for k in experiment_results_line.keys() if k.startswith("thread_")
-                    ]
-                    line_keys = line_keys_left + line_keys_right
-                    current_line = sep.join(str(experiment_results_line[key]) for key in line_keys)
-                    teeprint(content=current_line, file=csv_output_file)
+            result_str = " ".join(f"{k}={fmt_value(v)}" for k, v in result_fields.items())
+            print(f"[RESULT] {result_str}")
 
     def _record_data_dir(
         self,
@@ -1178,7 +1031,11 @@ class Benchmark:
         max_nb_digits = len(str(total_nb_runs))
         nb_run_str = f"{run_id:0{max_nb_digits}}"
 
-        dirnames = [f"{k}-{v}" for k, v in record_parameters.items()] + [f"run-{nb_run_str}"]
+        def _safe(value: object) -> str:
+            # a variable value must never spawn nested dirs in the result hierarchy
+            return str(value).replace(os.sep, "_").replace("/", "_")
+
+        dirnames = [f"{k}-{_safe(v)}" for k, v in record_parameters.items()] + [f"run-{nb_run_str}"]
         result = bdd.joinpath(*dirnames).resolve()
 
         if not result.is_dir():
@@ -1186,18 +1043,18 @@ class Benchmark:
 
         return result
 
-    def _log_headers(
+    def _campaign_metadata(
         self,
-        output_file,
-        experiment_name,
-        benchmark_duration_seconds,
-        nb_runs,
         start_time,
         expected_duration_seconds,
-    ) -> None:
-        def log_line(line, nb_dashes=1):
-            dashes_str = "#" * nb_dashes
-            print(f"{dashes_str} {line}", file=output_file)
+        prebuild_seconds,
+    ) -> Dict[str, Any]:
+        """
+        Gather the campaign-level provenance handed to the result store.
+
+        Environment detection stays benchmark-side (it needs the platform and
+        the benchmark sources); the store only persists the resulting mapping.
+        """
 
         def git_command(command):
             output = "N/A"
@@ -1214,35 +1071,28 @@ class Benchmark:
             result = output.strip()
             return result
 
-        log_line(f"benchmark_campaign_name: {experiment_name}")
-        log_line(f"benchmark_duration_seconds: {benchmark_duration_seconds}")
-        log_line(f"nb_runs: {nb_runs}")
-
-        date_val = start_time.strftime("%Y%m%d_%H%M%S")
-        log_line(f"date: {start_time}")
-        log_line(f"date_val: {date_val}")
-
-        branch = git_command("git rev-parse --abbrev-ref HEAD")
-        sha = git_command("git rev-parse HEAD")
-        log_line(f"git_branch: {branch}")
-        log_line(f"git_sha: {sha}")
-
-        kernel_full = self.platform.comm.shell(command="uname -a").strip()
-        log_line(f"kernel: {kernel_full}")
-
-        boot_args = get_boot_args()
-        log_line(f"kernel_boot_args: {boot_args}")
-
-        if self.tilt is not None:
-            tilt_compiler = self.tilt.get_compiler()
-            tilt_exact_compiler = self.tilt.get_exact_compiler()
-            log_line(f"tilt_compiler: {tilt_compiler}")
-            log_line(f"tilt_exact_compiler: {tilt_exact_compiler}")
+        metadata = {
+            "benchmark_campaign_name": self._experiment_name,
+            "benchmark_name": self._benchmark_name,
+            "benchmark_duration_seconds": self._benchmark_duration_seconds,
+            "nb_runs": self._nb_runs,
+            "date": str(start_time),
+            "date_val": start_time.strftime("%Y%m%d_%H%M%S"),
+            "git_branch": git_command("git rev-parse --abbrev-ref HEAD"),
+            "git_sha": git_command("git rev-parse HEAD"),
+            "kernel": self.platform.comm.shell(command="uname -a").strip(),
+            "kernel_boot_args": get_boot_args(),
+        }
 
         if expected_duration_seconds is not None:
-            expected_duration_pretty = seconds2pretty(expected_duration_seconds)
-            log_line(f"expected_duration_seconds: {expected_duration_seconds}")
-            log_line(f"expected_duration_pretty: {expected_duration_pretty}")
+            metadata["expected_duration_seconds"] = expected_duration_seconds
+            metadata["expected_duration_pretty"] = seconds2pretty(expected_duration_seconds)
+
+        if prebuild_seconds is not None:
+            metadata["prebuild_duration_seconds"] = prebuild_seconds
+            metadata["prebuild_duration_pretty"] = seconds2pretty(prebuild_seconds)
+
+        return metadata
 
     def _command_is_async(self) -> bool:
         return len(self._command_attachments) > 0

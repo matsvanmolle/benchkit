@@ -77,6 +77,7 @@ from benchkit.core.bktypes.callresults import BuildResult, FetchResult, RunResul
 from benchkit.core.bktypes.contexts import BuildContext, CollectContext, FetchContext, RunContext
 from benchkit.dependencies.packages import PackageDependency
 from benchkit.utils.buildtools import build_dir_from_ctx, cmake_build
+from benchkit.utils.dir import benchkit_dir, get_benches_dir
 from benchkit.utils.fetchtools import git_clone
 
 
@@ -91,12 +92,17 @@ class LevelDBBench:
     - collect: Parse performance metrics from output
     """
 
+    _PATCHES: Iterable[Path] = [
+        benchkit_dir() / "tutorials/leveldb-bench/patch.diff",
+        benchkit_dir() / "tutorials/leveldb-bench/patch02.diff",
+    ]
+
     def fetch(
         self,
         ctx: FetchContext,
-        parent_dir: Path,
-        commit: str = "",
-        patches: Iterable[Path] = (),
+        parent_dir: Path | None = None,
+        commit: str = "ac691084fdc5546421a55b25e7653d450e5a25fb",
+        patches: Iterable[Path] = _PATCHES,
     ) -> FetchResult:
         """
         Fetch LevelDB source code from GitHub.
@@ -109,10 +115,12 @@ class LevelDBBench:
             parent_dir: Directory where the LevelDB repository will be cloned.
             commit: Git commit hash, tag, or branch name (e.g., "v10.7.5").
                    Empty string means use default branch.
+            patches: Iterable of patch files to apply to the source, in order.
 
         Returns:
             FetchResult containing the path to the cloned repository.
         """
+        parent_dir = get_benches_dir(parent_dir=parent_dir, comm=ctx.platform.comm)
 
         leveldb_dir = git_clone(
             ctx=ctx,
@@ -139,6 +147,7 @@ class LevelDBBench:
     def build(
         self,
         ctx: BuildContext,
+        build_type: str = "Release",
     ) -> BuildResult:
         """
         Build LevelDB's db_bench tool and prepare test database.
@@ -157,8 +166,8 @@ class LevelDBBench:
         """
         platform = ctx.platform
         src_dir = ctx.fetch_result.src_dir
-        db_bench_path = src_dir / "db_bench"
-        obj_dir = build_dir_from_ctx(ctx=ctx)
+        obj_dir = build_dir_from_ctx(ctx=ctx, suffix=build_type.lower())
+        db_bench_path = obj_dir / "db_bench"
         tmpdb_dir = obj_dir / "tmp" / "benchkit_level_db"
 
         if not platform.comm.isfile(db_bench_path):
@@ -166,7 +175,7 @@ class LevelDBBench:
                 ctx=ctx,
                 src_dir=src_dir,
                 build_dir=obj_dir,
-                build_type="Release",
+                build_type=build_type,
                 target="db_bench",
             )
         if not platform.comm.isdir(tmpdb_dir):
@@ -287,6 +296,7 @@ class LevelDBBench:
                 - ofleft: Number of keys found (for read benchmarks, if reported).
                 - ofright: Total number of keys searched for (for read benchmarks,
                   if reported).
+                - duration_s: Total wall-clock execution time in seconds
 
         Raises:
             ValueError: If the expected benchstats line is missing or inconsistent
@@ -371,6 +381,9 @@ class LevelDBBench:
             if summary_re.group("ofleft") is not None:
                 record["ofleft"] = int(summary_re.group("ofleft"))
                 record["ofright"] = int(summary_re.group("ofright"))
+
+        duration_s = ctx.run_result.outputs[-1].duration_s
+        record["duration_s"] = duration_s
 
         return record
 

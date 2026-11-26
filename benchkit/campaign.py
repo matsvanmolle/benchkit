@@ -4,20 +4,29 @@
 Module to manage campaigns. Campaigns are the main unit of execution of benchmarks.
 A campaign is roughly 1 benchmark + N variables. A campaign also defines how the benchkit iterates
 over the variables.
+The execution of a campaign is orchestrated by `benchkit.engine.execution.ExecutionEngine`.
 """
 
 import datetime
 import glob
-import multiprocessing
 import os
 import os.path
 import pathlib
 import shutil
 import sys
+import warnings
 from collections import defaultdict
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from benchkit.benchmark import Benchmark
+from benchkit.engine.execution import ExecutionEngine
+from benchkit.engine.generators import (
+    CartesianGenerator,
+    FilteredGenerator,
+    ListGenerator,
+    RecordGenerator,
+)
+from benchkit.engine.stores import CsvJsonStore, ResultStore
 from benchkit.lwchart import (
     DataframeProcessor,
     generate_chart_from_multiple_csvs,
@@ -30,9 +39,6 @@ from benchkit.platforms import Platform, get_current_platform
 from benchkit.utils.dir import parentdir
 from benchkit.utils.misc import get_benchkit_temp_folder_str, seconds2pretty
 from benchkit.utils.types import Constants, PathType, Pretty
-from benchkit.utils.variables import cartesian_product
-
-_BENCHKIT_CAMPAIGN_CMD_FILE = f"{get_benchkit_temp_folder_str()}/benchkit-campaign.sh"
 
 
 class Campaign:
@@ -49,15 +55,31 @@ class Campaign:
         gdb: bool,
         enable_data_dir: bool,
         continuing: bool,
+        tmp_dir: pathlib.Path | None = None,
         symlink_latest: bool = False,
     ):
         self._check_parameters_integrity()
 
-        self._enable_data_dir = enable_data_dir
+        if not enable_data_dir:
+            warnings.warn(
+                "enable_data_dir=False is deprecated: the campaign data directory is now "
+                "always enabled (it hosts the campaign metadata and per-record results).",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        self._enable_data_dir = True
         self._continuing = continuing
         self._symlink_latest = symlink_latest
+        self._campaign_cmd_file = (
+            pathlib.Path(get_benchkit_temp_folder_str(tmp_dir=tmp_dir)) / "benchkit-campaign.sh"
+        )
 
         params: Dict[str, Any] = self.parameters
+
+        # Every campaign exposes a record generator; legacy subclasses that
+        # provide a bare parameters dict get a ListGenerator fallback.
+        if params.get("record_generator") is None and params.get("variables") is not None:
+            params["record_generator"] = ListGenerator(records=params.get("variables"))
 
         bds = None
         if "benchmark_duration_seconds" in params:
@@ -68,19 +90,55 @@ class Campaign:
                 raise ValueError(f'Ill formed self.parameters: missing "{param_key}" key.')
 
         self._benchmark = params.get("benchmark")
+
+        # The campaign builds the default store; later slices consolidate
+        # store selection onto ExecutionEngine(store=..., generator=...,
+        # policy=...) per the refactor plan. The protected access to the
+        # benchmark's JSON encoders is temporary, for the same reason.
+        if params.get("result_store") is None:
+            params["result_store"] = CsvJsonStore(
+                csv_output_path=self.csv_output_abs_path(),
+                base_data_dir=self.base_data_dir(),
+                pretty_variables=params.get("pretty"),
+                continuing=self._continuing,
+                json_encoder=self._benchmark._encoders,  # pylint: disable=protected-access
+            )
+
         self._benchmark.configure_variables(
             experiment_name=params.get("experiment_name"),
             benchmark_name=params.get("benchmark_name"),
-            csv_output_path=self.csv_output_abs_path(),
+            result_store=params.get("result_store"),
             base_data_dir=self.base_data_dir(),
             benchmark_duration_seconds=bds,
             nb_runs=params.get("nb_runs"),
             constants=params.get("constants"),
             variables=params.get("variables"),
-            pretty_variables=params.get("pretty"),
             debug=debug,
             gdb=gdb,
         )
+
+    @property
+    def record_generator(self) -> Optional[RecordGenerator]:
+        """
+        Return the record generator describing the parameter space explored by this campaign.
+
+        Returns:
+            Optional[RecordGenerator]:
+                the record generator of this campaign, or None if the campaign was built
+                without variables.
+        """
+        return self.parameters.get("record_generator")
+
+    @property
+    def result_store(self) -> Optional[ResultStore]:
+        """
+        Return the result store persisting the records of this campaign.
+
+        Returns:
+            Optional[ResultStore]:
+                the result store of this campaign; None only before construction completes.
+        """
+        return self.parameters.get("result_store")
 
     def csv_file(
         self,
@@ -177,7 +235,6 @@ class Campaign:
     def campaign_run(
         self,
         other_campaigns_seconds: int,
-        barrier: Optional[multiprocessing.Barrier],
     ) -> None:
         """
         Run a single campaign among other campaigns in a suite.
@@ -185,48 +242,18 @@ class Campaign:
         Args:
             other_campaigns_seconds (int):
                 time remaining to execute other campaigns in the suite.
-            barrier (Optional[multiprocessing.Barrier]):
-                if needed, the barrier used to synchronize different benchmarks.
         """
-        # Workaround to trunc this global file, before logging refactoring TODO
-        self._init_cmd_file()
-
-        csv_output_path = self.csv_output_abs_path()
-        csv_output_dir = os.path.dirname(csv_output_path)
-        os.makedirs(csv_output_dir, exist_ok=True)
-
-        base_data_dir = self.base_data_dir()
-        if self._symlink_latest and base_data_dir:
-            symlink = str(csv_output_path).rsplit("_", 3)[0]
-            base_data_dir = pathlib.Path(base_data_dir)
-            symlink_path = pathlib.Path(symlink + "_latest")
-            if symlink_path.exists(follow_symlinks=False):
-                os.remove(symlink_path)
-            os.symlink(base_data_dir, symlink_path, True)
-            # Create a `results.csv` symlink inside of the data directory
-            # that links to the to the results CSV file.
-            abs_data_dir_result_path = base_data_dir / "results.csv"
-            os.symlink(csv_output_path, abs_data_dir_result_path)
-        elif self._symlink_latest:
-            symlink = str(csv_output_path).rsplit("_", 3)[0]
-            symlink_path = pathlib.Path(symlink + "_latest.csv")
-            if symlink_path.exists(follow_symlinks=False):
-                os.remove(symlink_path)
-            os.symlink(csv_output_path, symlink_path, False)
-
-        self._benchmark.check_dependencies()
-        self._benchmark.run(
+        engine = ExecutionEngine()
+        engine.run(
+            campaign=self,
             other_campaigns_seconds=other_campaigns_seconds,
-            barrier=barrier,
-            continuing=self._continuing,
         )
-        self._move_cmd_file()
 
     def run(self):
         """
         Run a single campaign, forwarding the call to `campaign_run`.
         """
-        self.campaign_run(other_campaigns_seconds=0, barrier=None)
+        self.campaign_run(other_campaigns_seconds=0)
 
     def campaign_duration_seconds(self) -> int:
         """
@@ -293,7 +320,7 @@ class Campaign:
             raise ValueError('Campaign parameters dict has no "nb_runs" field.')
 
     def _init_cmd_file(self) -> None:
-        with open(_BENCHKIT_CAMPAIGN_CMD_FILE, "w") as f:
+        with open(self._campaign_cmd_file, "w") as f:
             header = ["#!/bin/sh", "set -e", ""]
             f.writelines(f"{line}\n" for line in header)
 
@@ -301,7 +328,7 @@ class Campaign:
         bdd = self.base_data_dir()
         if bdd is not None:
             dst_path = pathlib.Path(bdd) / "commands.sh"
-            shutil.move(_BENCHKIT_CAMPAIGN_CMD_FILE, dst_path)
+            shutil.move(self._campaign_cmd_file, dst_path)
 
 
 class CampaignSuite:
@@ -337,16 +364,14 @@ class CampaignSuite:
             self._durations = [c.campaign_duration_seconds() for c in self._campaigns]
         return self._durations
 
-    def run_suite(
-        self,
-        parallel: bool = False,
-    ) -> None:
+    def run_suite(self) -> None:
         """
-        Run the suite of campaign, running sequentially or in parallel each campaign in the suite.
+        Run the suite of campaigns, sequentially.
 
-        Args:
-            parallel (bool, optional):
-                whether to run campaigns in the suite in parallel. Defaults to False.
+        Co-executing benchmarks is not a suite concern: it is superseded by
+        the multi-benchmark parallel policy of the execution engine (the
+        former barrier-based `parallel=True` mode deadlocked on any asymmetry
+        between campaigns and has been removed).
         """
         for campaign in self._campaigns:
             campaign._benchmark.check_dependencies()
@@ -358,23 +383,8 @@ class CampaignSuite:
         else:
             remaining = [sum(durations[i + 1 :]) for i in range(len(durations))]
 
-        process_list = []
-        barrier = multiprocessing.Barrier(len(self._campaigns))
-
-        if not parallel:
-            for campaign, remaining_seconds in zip(self._campaigns, remaining):
-                campaign.campaign_run(other_campaigns_seconds=remaining_seconds, barrier=None)
-        else:
-            for campaign in self._campaigns:
-                p = multiprocessing.Process(
-                    target=campaign.campaign_run,
-                    args=(0, barrier),
-                )
-                process_list.append(p)
-                p.start()
-
-        for p in process_list:
-            p.join()
+        for campaign, remaining_seconds in zip(self._campaigns, remaining):
+            campaign.campaign_run(other_campaigns_seconds=remaining_seconds)
 
     def print_durations(self) -> None:
         """
@@ -501,7 +511,7 @@ class CampaignTemplate(Campaign):
         name: str,
         benchmark: Benchmark,
         nb_runs: int,
-        variables: Iterable[Dict[str, Any]],
+        variables: Optional[Iterable[Dict[str, Any]]],
         constants: Constants,
         debug: bool,
         gdb: bool,
@@ -509,9 +519,18 @@ class CampaignTemplate(Campaign):
         continuing: bool,
         benchmark_duration_seconds: Optional[int] = None,
         results_dir: Optional[PathType] = None,
+        tmp_dir: pathlib.Path | None = None,
         pretty: Pretty | None = None,
         symlink_latest: bool = False,
+        record_generator: Optional[RecordGenerator] = None,
     ):
+        if (variables is None) == (record_generator is None):
+            raise ValueError(
+                "Campaign: provide exactly one of the variables or record_generator arguments."
+            )
+        if record_generator is None:
+            record_generator = ListGenerator(records=variables)
+
         csv_filename = self.csv_file(
             campaign_name="benchmark",
             suffix=f"_{name}",
@@ -531,7 +550,7 @@ class CampaignTemplate(Campaign):
         if constants is not None:
             all_constants.update(constants)
 
-        list_variables = list(variables)
+        list_variables = list(record_generator.records())
 
         variable_names = {key for record in list_variables for key in record}
         constant_names = set(all_constants)
@@ -551,6 +570,7 @@ class CampaignTemplate(Campaign):
             "nb_runs": nb_runs,
             "constants": all_constants,
             "variables": list_variables,
+            "record_generator": record_generator,
         }
 
         if benchmark_duration_seconds is not None:
@@ -564,6 +584,7 @@ class CampaignTemplate(Campaign):
             gdb=gdb,
             enable_data_dir=enable_data_dir,
             continuing=continuing,
+            tmp_dir=tmp_dir,
             symlink_latest=symlink_latest,
         )
 
@@ -587,6 +608,7 @@ class CampaignIterateVariables(CampaignTemplate):
         continuing: bool = False,
         benchmark_duration_seconds: Optional[int] = None,
         results_dir: Optional[PathType] = None,
+        tmp_dir: pathlib.Path | None = None,
         pretty: Pretty | None = None,
         symlink_latest: bool = False,
     ):
@@ -602,6 +624,7 @@ class CampaignIterateVariables(CampaignTemplate):
             continuing=continuing,
             benchmark_duration_seconds=benchmark_duration_seconds,
             results_dir=results_dir,
+            tmp_dir=tmp_dir,
             pretty=pretty,
             symlink_latest=symlink_latest,
         )
@@ -627,20 +650,25 @@ class CampaignCartesianProduct(CampaignTemplate):
         continuing: bool = False,
         benchmark_duration_seconds: Optional[int] = None,
         results_dir: Optional[PathType] = None,
+        tmp_dir: pathlib.Path | None = None,
         pretty: Pretty | None = None,
         filter_func: Optional[Callable[[Dict[str, Any]], bool]] = None,
         symlink_latest: bool = False,
     ):
-        records_gen = cartesian_product(variables)
+        record_generator: RecordGenerator = CartesianGenerator(variables=variables)
 
         if filter_func:
-            records_gen = filter(filter_func, records_gen)
+            record_generator = FilteredGenerator(
+                generator=record_generator,
+                predicate=filter_func,
+            )
 
         super().__init__(
             name=name,
             benchmark=benchmark,
             nb_runs=nb_runs,
-            variables=records_gen,
+            variables=None,
+            record_generator=record_generator,
             constants=constants,
             debug=debug,
             gdb=gdb,
@@ -648,6 +676,7 @@ class CampaignCartesianProduct(CampaignTemplate):
             continuing=continuing,
             benchmark_duration_seconds=benchmark_duration_seconds,
             results_dir=results_dir,
+            tmp_dir=tmp_dir,
             pretty=pretty,
             symlink_latest=symlink_latest,
         )
