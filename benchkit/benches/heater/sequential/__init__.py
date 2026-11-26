@@ -3,10 +3,12 @@
 """
 Heater sequential microbenchmark for benchkit.
 
-This benchmark is a tiny CPU "heater" that runs a tight loop for a fixed
-duration and reports the number of "operations performed". It is primarily
-used to demonstrate benchkit workflows and to characterize per-core behavior
-(e.g., sweeping CPU core IDs and plotting ops/core).
+This benchmark is a scalar CPU "heater" that runs a tight loop for a fixed
+duration and reports nominal integer operations. Its loop contains independent
+arithmetic dependency chains and dynamic branches, exercising instruction-level
+parallelism, out-of-order scheduling, and front-end branch handling. It is
+primarily used to characterize per-core behavior (e.g., sweeping CPU core IDs
+and plotting ops/core).
 
 Protocol phases (benchkit core protocol):
 - fetch: materialize heaterseq.c into a working source directory
@@ -106,8 +108,9 @@ class HeaterSequentialBench:
         ctx.platform.comm.makedirs(src_dir, exist_ok=True)
 
         heater_c = src_dir / "heaterseq.c"
-        if not ctx.platform.comm.isfile(heater_c):
-            ctx.platform.comm.write_content_to_file(content=_HEATER_C, output_filename=heater_c)
+        # Always materialize the tracked source. This ensures an existing
+        # workspace cannot silently run an older heater implementation.
+        ctx.platform.comm.write_content_to_file(content=_HEATER_C, output_filename=heater_c)
 
         return FetchResult(src_dir=src_dir)
 
@@ -130,12 +133,19 @@ class HeaterSequentialBench:
         obj_dir = src_dir
 
         exe_path = obj_dir / "heaterseq"
-        if not platform.comm.isfile(exe_path):
-            ctx.exec(
-                argv=["gcc", "-O3", "-o", str(exe_path), str(src_dir / "heaterseq.c")],
-                cwd=obj_dir,
-                output_is_log=True,
-            )
+        # Rebuild every time because fetch deliberately refreshes the source.
+        ctx.exec(
+            argv=[
+                "gcc",
+                "-O3",
+                "-fno-tree-vectorize",
+                "-o",
+                str(exe_path),
+                str(src_dir / "heaterseq.c"),
+            ],
+            cwd=obj_dir,
+            output_is_log=True,
+        )
 
         return BuildResult(
             build_dir=obj_dir,
@@ -207,7 +217,7 @@ class HeaterSequentialBench:
 
 
 def heater_seq_campaign(
-    name: str = "sequential_heater_campaign",
+    name: str = "ilp_branch_heater_campaign",
     results_dir: PathType | None = None,
     platform: Platform | None = None,
     nb_runs: int = 1,

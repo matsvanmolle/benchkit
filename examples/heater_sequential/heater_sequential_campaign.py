@@ -31,7 +31,7 @@ def main() -> None:
         plot_name="barplot",
         x="cpu",
         y="ops",
-        title=f"Sequential Heater on {get_current_platform().comm.hostname()}",
+        title=f"ILP and Branch Heater on {get_current_platform().comm.hostname()}",
     )
 
 
